@@ -32,6 +32,8 @@ spec:
                       labels:
                         - preview
                     requeueAfterSeconds: 1800 # TODO: Configure webhook to trigger this
+                    values:
+                      pr_branch: '{{ .branch }}'
           - clusters:
               selector:
                 matchExpressions:
@@ -57,7 +59,7 @@ spec:
         github.com/target-branch-slug: '{{ .target_branch_slug }}'
         github.com/branch: '{{ .branch }}'
         github.com/branch-slug: '{{ .branch_slug }}'
-        github.com/ref: '{{ .branch_slug }}' # TODO: Use '{{ .pr_branch }}' once https://github.com/argoproj/argo-cd/pull/21110 is available
+        github.com/ref: '{{ .values.pr_branch }}'
         github.com/author: '{{ .author }}'
       finalizers:
         - resources-finalizer.argocd.argoproj.io
