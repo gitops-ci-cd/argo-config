@@ -1,0 +1,134 @@
+name: "Bump Argo Helm targetRevision"
+description: "Bump Argo ApplicationSet Helm chart targetRevision to latest (Helm repo or OCI), open/update PR."
+
+inputs:
+  file:
+    description: "Path to the *-addon.yaml file"
+    required: true
+  chart:
+    description: "Helm chart name"
+    required: true
+  repoURL:
+    description: "Helm repo URL (https://...) or OCI registry (oci://...)"
+    required: true
+  current:
+    description: "Current targetRevision"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve latest chart version
+      id: latest
+      shell: bash
+      env:
+        FILE: ${{ inputs.file }}
+        CHART: ${{ inputs.chart }}
+        REPO: ${{ inputs.repoURL }}
+        CURRENT: ${{ inputs.current }}
+      run: |
+        set -euo pipefail
+
+        if [[ "$REPO" == oci://* ]]; then
+          # OCI: repo URL already includes the full path to the chart
+          OCI_REPO="${REPO#oci://}"
+
+          # List tags, filter semver-ish, sort, pick latest
+          # (Adjust grep if you use tags like v1.2.3)
+          latest="$(crane ls "$OCI_REPO" \
+            | grep -E '^[0-9]+(\.[0-9]+){1,3}([-+].*)?$' \
+            | sort -V \
+            | tail -n 1 || true)"
+        else
+          # Helm repo: use index.yaml via helm search
+          helm repo add tmpRepo "$REPO" --force-update >/dev/null
+          helm repo update tmpRepo >/dev/null
+
+          # helm search already returns versions sorted by semver (newest first)
+          latest="$(helm search repo "tmpRepo/$CHART" --versions -o json \
+            | jq -r '.[0].version' || true)"
+        fi
+
+        if [[ -z "$latest" || "$latest" == "null" ]]; then
+          echo "ERROR: could not determine latest version for $CHART from $REPO" >&2
+          exit 1
+        fi
+
+        # Normalize: strip 'v' prefix if present to match targetRevision format
+        latest="${latest#v}"
+
+        echo "latest=$latest" >> "$GITHUB_OUTPUT"
+        echo "LATEST=$latest"
+
+    - name: Skip if up-to-date
+      if: ${{ steps.latest.outputs.latest == inputs.current }}
+      shell: bash
+      env:
+        CHART: ${{ inputs.chart }}
+        CURRENT: ${{ inputs.current }}
+      run: |
+        echo "Up-to-date: $CHART ($CURRENT)"
+
+    - name: Update file + open/update PR
+      if: ${{ steps.latest.outputs.latest != inputs.current }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        FILE: ${{ inputs.file }}
+        CHART: ${{ inputs.chart }}
+        REPO: ${{ inputs.repoURL }}
+        CURRENT: ${{ inputs.current }}
+        LATEST: ${{ steps.latest.outputs.latest }}
+      run: |
+        set -euo pipefail
+
+        # Base branch is the default branch of the repo
+        base="$(git remote show origin | awk '/HEAD branch/ {print $NF}')"
+        [[ -n "$base" ]] || base="main"
+
+        # Stable branch per chart so the PR gets UPDATED as newer versions appear
+        safe_chart="$(echo "$CHART" | tr '/' '-' | tr -cd '[:alnum:]._:-')"
+        branch="bump-helm/${safe_chart}"
+
+        # Configure git identity
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        git fetch origin "$base" --depth=1
+        git checkout -B "$branch" "origin/$base"
+
+        # Find the specific source entry matching this chart name
+        idx="$(CHART="$CHART" yq '.spec.template.spec.sources | to_entries | map(select(.value.chart == strenv(CHART))) | .[0].key' "$FILE")"
+        if [[ -z "$idx" || "$idx" == "null" ]]; then
+          echo "ERROR: could not locate source with chart=$CHART in $FILE" >&2
+          exit 1
+        fi
+
+        yq -i ".spec.template.spec.sources[$idx].targetRevision = \"$LATEST\"" "$FILE"
+
+        if git diff --quiet; then
+          echo "No diff after update; exiting."
+          exit 0
+        fi
+
+        git add "$FILE"
+        git commit -m "chore(helm): bump ${CHART} ${CURRENT} -> ${LATEST}"
+        git push -u origin "$branch" --force
+
+        title="chore(helm): bump ${CHART} to ${LATEST}"
+        body=$(cat <<EOF
+        Automated bump of Helm chart used by ArgoCD ApplicationSet.
+
+        - Chart: \`${CHART}\`
+        - Repo: \`${REPO}\`
+        - \`${CURRENT}\` -> \`${LATEST}\`
+        EOF
+        )
+
+        existing="$(gh pr list --head "$branch" --json number -q '.[0].number' || true)"
+        if [[ -n "$existing" && "$existing" != "null" ]]; then
+          echo "PR already exists (#$existing). Updated branch."
+          gh pr edit "$branch" --title "$title" --body "$body" >/dev/null || true
+        else
+          gh pr create --base "$base" --head "$branch" --title "$title" --body "$body"
+        fi
