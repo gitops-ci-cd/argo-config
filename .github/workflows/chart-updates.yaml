@@ -1,0 +1,101 @@
+name: Chart Updates
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 */8 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build matrix from applicable application sets
+        id: mk
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+
+          files=(**/*.yaml **/*.yml)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Build JSON include array via jq
+          include="[]"
+          for f in "${files[@]}"; do
+            # read all sources[] entries that have chart/repoURL/targetRevision
+            count="$(yq '.spec.template.spec.sources[] | select(.chart != null) | .chart' "$f" | wc -l || echo 0)"
+
+            for i in $(seq 0 $((count - 1))); do
+              chart="$(yq -r ".spec.template.spec.sources[] | select(.chart != null) | .chart" "$f" | sed -n "$((i+1))p" || true)"
+              repoURL="$(yq -r ".spec.template.spec.sources[] | select(.chart != null) | .repoURL" "$f" | sed -n "$((i+1))p" || true)"
+              current="$(yq -r ".spec.template.spec.sources[] | select(.chart != null) | .targetRevision" "$f" | sed -n "$((i+1))p" || true)"
+
+              [[ -z "$chart" || "$chart" == "null" ]] && continue
+              [[ -z "$repoURL" || "$repoURL" == "null" ]] && continue
+              [[ -z "$current" || "$current" == "null" ]] && continue
+
+              include="$(jq -c \
+                --arg file "$f" \
+                --arg chart "$chart" \
+                --arg repoURL "$repoURL" \
+                --arg current "$current" \
+                '. + [{name:$chart, file:$file, chart:$chart, repoURL:$repoURL, current:$current}]' \
+                <<<"$include")"
+            done
+          done
+
+          matrix="$(jq -c '{include: .}' <<<"$include")"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix"
+
+  bump:
+    needs: discover
+    if: ${{ fromJson(needs.discover.outputs.matrix).include[0] != null }}
+    runs-on: ubuntu-latest
+    name: bump (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: azure/setup-helm@v4
+
+      - name: Install crane (for OCI charts)
+        run: |
+          set -euo pipefail
+          CRANE_VERSION="v0.20.6"
+          curl -fsSL \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            -o /tmp/crane.tgz
+          tar -xzf /tmp/crane.tgz -C /tmp crane
+          sudo mv /tmp/crane /usr/local/bin/crane
+
+      - name: Sanity check tooling
+        run: |
+          set -euo pipefail
+          yq --version
+          jq --version
+          gh --version
+          helm version
+          crane version
+
+      - name: Bump chart
+        uses: ./.github/actions/bump-argo-helm
+        with:
+          file: ${{ matrix.file }}
+          chart: ${{ matrix.chart }}
+          repoURL: ${{ matrix.repoURL }}
+          current: ${{ matrix.current }}
