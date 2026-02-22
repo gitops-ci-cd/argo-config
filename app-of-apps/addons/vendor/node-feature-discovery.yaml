@@ -24,7 +24,7 @@ spec:
       project: addons
       sources:
         - chart: node-feature-discovery
-          targetRevision: 0.15.4
+          targetRevision: 0.18.3
           repoURL: https://kubernetes-sigs.github.io/node-feature-discovery/charts
           helm:
             ignoreMissingValueFiles: true
