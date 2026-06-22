@@ -15,7 +15,7 @@ jobs:
     outputs:
       matrix: ${{ steps.mk.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Build matrix from applicable application sets
         id: mk
@@ -69,7 +69,7 @@ jobs:
       matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: azure/setup-helm@v4
 
